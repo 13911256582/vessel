@@ -54,11 +54,16 @@ class RedisThread(threading.Thread):
 		self.thread_stop = True
 
 
+
+#request/response format:
+#{"type": "request", "sender", sender, "request": "create", ...}
+#{"type": "response", "sender": sender, "response": {"status": "ok|error", ...}}
+
 class WorkerThread(RedisThread):
 	def __init__(self, name, subChannels, context):
 		RedisThread.__init__(self, name, subChannels, context)
 		self.handler = self
-		self.callback = None
+		#self.callback = None
 
 	def onMessage(self, topic, msg, context):
 		print("-->", self.name, "topic:", topic, "message:", msg)
@@ -78,27 +83,28 @@ class WorkerThread(RedisThread):
 			elif req['type'] == 'request':
 
 				if req['request'] == 'create':
-					e = worker.create(req['topics'], req['actor'])
-					self.sendStatus(req['sender'], e)
+					ret = worker.create(req['topics'], req['actor'])
+					status = {"status": ret}
+					self.sendResponse(req['sender'], status)
 					return
 
 				elif req['request'] == 'load':
-					e = worker.load(req['actor'], req['func'], req['code'])
-					self.sendStatus(req['sender'], e)
+					ret = worker.load(req['actor'], req['func'], req['code'])
+					status = {"status": ret}
+					self.sendResponse(req['sender'], status)
 					return
 
 				elif req['request'] == 'enable':
-					e = worker.enable(req['actor'])
-					self.sendStatus(req['sender'], e)
+					ret = worker.enable(req['actor'])
+					status = {"status": ret}
+					self.sendResponse(req['sender'], status)
 					return
 		else:
 			return
 
-	def sendStatus(self, sender, status):
-		msg = {"type": "response", "sender": sender, "response": status}
-		self.sendResponse(msg)
 
-	def sendResponse(self, response):
+	def sendResponse(self, sender, status):
+		response = {"type": "response", "sender": sender, "response": status}
 		print("<--", "topic:", self.context.publishChannel, "message:", response)
 		print("\n\n")
 		self.redis.publish(self.context.publishChannel, json.dumps(response))

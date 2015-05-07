@@ -103,10 +103,15 @@ class MasterThread(RedisThread):
 			master.register(data['type'], data['workerID'])
 
 	def handleClient(self, data):
-		pass
+		data = json.loads(msg)
+		if data['request'] == 'connect':
+			master = self.context
+			master.connect(data['clientID'])
 
 class Source():
 	pass
+
+
 
 
 #master and worker communication has three channels:
@@ -144,7 +149,7 @@ class Worker():
 		ret, response = self._doRequest(sender, req)
 
 		if ret == 'ok':
-			actor = Actor(name, name)
+			actor = Actor(name, name, sender, self.uuid)
 			self.actors[actor.uuid] = actor
 			return ("ok", actor)
 		else:
@@ -205,13 +210,46 @@ class Worker():
 		pass
 
 
+class User():
+	pass
+
 
 class Actor():
-	def __init__(self, name, uuid):
+	def __init__(self, name, uuid, clientID, workerID):
 		self.name = name
 		self.uuid = uuid
+		self.clientID = clientID
+		self.workerID = workerID
 
+
+class ClientThread(RedisThread):
+	def __init__(self, name, subChannels, context):
+		RedisThread.__init__(self, name, subChannels, context)
+		self.handler = self
+
+	def onMessage(self, topic, msg, context):
+		pass
+
+	def sendResponse(self, sender, status):
+		response = {"type": "response", "sender": sender, "response": status}
+		print("<--", "topic:", self.context.publishChannel, "message:", response)
+		print("\n\n")
+		self.redis.publish(self.context.publishChannel, json.dumps(response))
+
+
+
+#as client connection will come and go, so need to handle unexpected dead client, which still consume client/client thread resources. 
+#so a timeout is needed to make sure, idle client will be kicked out. 
 class Client():
+	def __init__(self, userID, sessionID):
+		self.userID = userID
+		self.uuid = sessionID
+		self.actors = {}
+		self.subChannel = "master/client/" + self.uuid
+		self.pubChannel = "client/" + self.uuid
+		self.thread = None
+		self.redis = None
+
 	def map(self, source, topics, actor):
 		pass
 
@@ -233,18 +271,69 @@ class Client():
 	def delete(self, actor):
 		pass
 
+	def expire(self)
+
 
 
 class Master():
 	def __init__(self):
 		self.workers = {}
 		self.clients = {}
-		self.sources = {}
+		self.users = {}
+		self.redisWorkersKey = "system/workers"
+		self.redisUsersKey = "system/users"
 
 	def run(self):
 		self.redis = redis.StrictRedis()
 		thread = MasterThread(self)
 		thread.start()
+
+	def loadWorkers(self):
+		self.workers = {}
+		workers = self.loadFromRedis(self.redisWorkersKey)
+		self.workers = json.loads(workers)
+
+	def loadUsers(self):
+		self.users = {}
+		users = self.loadFromRedis(self.redisUsersKey)
+		self.workers = json.loads(users)
+
+	def addWoker(self, worker):
+		if worker.uuid in self.workers:
+			return False
+		else:
+			self.workers[worker.uuid] = worker
+			self.saveToRedis(self.redisWorkersKey, json.dumps(self.workers))
+			return True
+
+	def delWoker(self, worker):
+		if not worker.uuid in self.workers:
+			return False
+		else:
+			del self.workers[workers.uuid]
+			self.saveToRedis(self.redisWorkersKey, json.dumps(self.workers))
+			return True			
+
+	def addUser(self, user):
+		if user.uuid in user.workers:
+			return False
+		else:
+			self.users[user.uuid] = user
+			self.saveToRedis(self.redisUsersKey, json.dumps(self.users))
+			return True
+
+	def delUser(self, user):
+		if not user.uuid in user.workers:
+			return False
+		else:
+			del self.users[user.uuid]
+			self.saveToRedis(self.redisUsersKey, json.dumps(self.users))
+			return True
+
+	def saveToRedis(self, key, value):
+
+	def loadFromRedis(self, key):
+
 
 	#admin
 	def getWorker(self, worker):
@@ -261,23 +350,25 @@ class Master():
 	#worker -> master
 	def register(self, workerType, workerID):
 		if not workerID in self.workers:
-			worker = Worker("worker/1", workerType, workerID)
+			worker = Worker("worker/1", workerType, workerID)			#temp code for debug 
 			if worker:
 				self.workers[workerID] = worker
 				worker.run()
-				msg = {"type" : "response", "response":"ok"}
 
-				self.notify(worker.pubChannel, msg)
-				#worker._sendMessage(msg)
+				self.sendResponse(worker.pubChannel, "ok")
+
 				print("worker registered:", workerID)
 			else:
 				e = "error: register failed"
-				msg = {"type": "response", "response":e}
-				self.notify(worker.pubChannel, msg)
+				self.sendResponse(worker.pubChannel, e)
+
+				print(e)
+
 		else:
 			e = "error: worker exist "
-			msg = {"type": "response", "response":e}
-			self.notify(worker.pubChannel, msg)
+			self.sendResponse(worker.pubChannel, e)
+
+			print(e)
 
 	def pickWorker(self, workerType):
 		for worker in self.workers:
@@ -285,13 +376,38 @@ class Master():
 				return self.workers[worker]
 		return None
 
-	def notify(self, channel, message):
+	def sendResponse(self, channel, status, data=None):
+		if data:
+			message = {"type": "response", "response": {"status": status, "data": data}}
+		else:
+			message = {"type": "response", "response": {"status": status}}
+
 		print("<--", "channel:", channel, "message:", message)
 		self.redis.publish(channel, json.dumps(message))
 
+
 	#client side interfaces
-	def connect(self, client):
-		pass
+	def connect(self, userID, sessionID):
+		if not sessionID in self.clients:
+			client = Client(userID, clientID)
+			if client:
+				self.clients[clientID] = client
+				client.run()
+				self.sendResponse(client.pubChannel, "ok")
+
+				print("new client connected:", clientID)
+			else:
+				e = "error: client connected failed"
+				self.sendResponse(client.pubChannel, e)
+
+				print(e)
+
+		else:
+			e = "error: client exist "
+			self.sendResponse(client.pubChannel, e)
+
+			print(e)
+
 
 	def close(self, client):
 		pass
@@ -299,30 +415,6 @@ class Master():
 	def list(self, client):
 		pass
 
-	def map(self, client, source, topics, actor):
-		if self.clients[client]:
-			ret = self.clients[client].map(source, topics, actor)
-			return ret
-		else:
-			return "error: client not exist"
-
-	def load(self, client, actor, code):
-		pass
-
-	def set(self, client, actor, setting):
-		pass
-
-	def get(self, client, actor):
-		pass
-
-	def enable(self, client, actor):
-		pass
-
-	def disable(self, client, actor):
-		pass
-
-	def delete(self, client, actor):
-		pass
 
 
 def loadCode(name):
