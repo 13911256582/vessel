@@ -81,15 +81,47 @@ class WorkerThread(RedisThread):
 		self.thread_stop = True
 
 
-
-class MasterThread(RedisThread):
-	def __init__(self, context):
-		RedisThread.__init__(self, "master", ["master/worker", "master/client"], context)
+class ClientThread(RedisThread):
+	def __init__(self, name, subChannels, context):
+		RedisThread.__init__(self, name, subChannels, context)
+		self.handler = self
 
 	def onMessage(self, message, context):
-		if message['type'] == 'message' and message['channel'] == "master/worker":
+		topic = message['channel']
+		msg= json.loads(message['data'])
+		client = context
+
+		print("-->", "topic:", topic, "message:", msg)
+
+		if topic == 'master/client/' + client.uuid:
+			if msg['type'] == 'response':
+				print("-->", "response:", req['response'])
+
+			elif msg['type'] == 'request':
+				if msg['request'] == 'map':
+					ret, actor = client.map(msg['source'], msg['topics'], msg['actor'])
+					status = {"status": ret, "actor": actor.uuid}
+					self.sendResponse(status)
+					return
+		else:
+			return
+
+	def sendResponse(self, status):
+		response = {"type": "response", "response": status}
+		print("<--", "topic:", self.context.pubChannel, "message:", response)
+		print("\n\n")
+		self.redis.publish(self.context.pubChannel, json.dumps(response))
+
+
+class MasterThread(RedisThread):
+	def __init__(self, name, subChannels, context):
+		RedisThread.__init__(self, name, subChannels, context)
+
+	def onMessage(self, message, context):
+		master = context
+		if message['type'] == 'message' and message['channel'] == master.subChannels[0]:
 			self.handlWorker(message['data'])
-		elif message['type'] == 'message' and message['channel'] == "master/client":
+		elif message['type'] == 'message' and message['channel'] == master.subChannels[1]:
 			self.handleClient(message['data'])
 		else:
 			print(message)
@@ -102,11 +134,11 @@ class MasterThread(RedisThread):
 			#convert unicode to str
 			master.register(data['type'], data['workerID'])
 
-	def handleClient(self, data):
+	def handleClient(self, msg):
 		data = json.loads(msg)
 		if data['request'] == 'connect':
 			master = self.context
-			master.connect(data['clientID'])
+			master.connect(data['userID'], data['clientID'])
 
 class Source():
 	pass
@@ -209,49 +241,70 @@ class Worker():
 	def list(self):
 		pass
 
+	def close(self):
+		self.thread.stop()
+		self.redis.publish(self.pubChannel, "exit")
+		self.redis.publish(self.subChannel, "exit")
 
-class User():
-	pass
 
 
 class Actor():
-	def __init__(self, name, uuid, clientID, workerID):
+	def __init__(self, name, uuid, userID, workerID):
 		self.name = name
 		self.uuid = uuid
-		self.clientID = clientID
+		self.userID = userID
 		self.workerID = workerID
 
+	def toString():
+		actor = {"name": self.name, "uuid":self.uuid, "userID":self.userID, "workerID": self.workerID}
+		return json.dumps(actor)
 
-class ClientThread(RedisThread):
-	def __init__(self, name, subChannels, context):
-		RedisThread.__init__(self, name, subChannels, context)
-		self.handler = self
 
-	def onMessage(self, topic, msg, context):
-		pass
+class User():
+	def __init__(self, userID):
+		self.uuid = userID
+		self.actors = {}
 
-	def sendResponse(self, sender, status):
-		response = {"type": "response", "sender": sender, "response": status}
-		print("<--", "topic:", self.context.publishChannel, "message:", response)
-		print("\n\n")
-		self.redis.publish(self.context.publishChannel, json.dumps(response))
+	def toString():
+		user = {"uuid": self.uuid}
+		actors = []
+		for actor in self.actors:
+			actors.append(actor.toString())
+		user['actors'] = actors
+		return json.dumps(user)
+
 
 
 
 #as client connection will come and go, so need to handle unexpected dead client, which still consume client/client thread resources. 
 #so a timeout is needed to make sure, idle client will be kicked out. 
 class Client():
-	def __init__(self, userID, sessionID):
+	def __init__(self, userID, sessionID, master):
 		self.userID = userID
 		self.uuid = sessionID
-		self.actors = {}
+		self.master = master
 		self.subChannel = "master/client/" + self.uuid
 		self.pubChannel = "client/" + self.uuid
 		self.thread = None
 		self.redis = None
 
+	def run(self):
+		self.redis = redis.StrictRedis()
+		thread = ClientThread(self.uuid, ["master/client", self.subChannel], self)
+		thread.start()
+		self.thread = thread
+
 	def map(self, source, topics, actor):
-		pass
+		print("map request:", "source:", source, "topics:", topics, "actor:", actor)
+
+		worker = self.master.pickWorker("redis")
+		if worker:
+			sender = self.uuid
+			worker.thread.addQueue(sender)				#a queue for each client session
+			error, actor = worker.createActor(sender, topics, actor)
+			return "ok", actor
+		else:
+			return "error: no worker available", None
 
 	def load(self, actor, code):
 		pass
@@ -271,7 +324,13 @@ class Client():
 	def delete(self, actor):
 		pass
 
-	def expire(self)
+	def expire(self):
+		pass
+
+	def close(self):
+		self.thread.stop()
+		self.redis.publish(self.pubChannel, "exit")
+		self.redis.publish(self.subChannel, "exit")
 
 
 
@@ -282,57 +341,67 @@ class Master():
 		self.users = {}
 		self.redisWorkersKey = "system/workers"
 		self.redisUsersKey = "system/users"
+		self.subChannels = ["master/worker", "master/client"]
+		self.thread = None
+
 
 	def run(self):
 		self.redis = redis.StrictRedis()
-		thread = MasterThread(self)
+		thread = MasterThread("master", self.subChannels, self)
 		thread.start()
+		self.thread = thread
 
 	def loadWorkers(self):
 		self.workers = {}
 		workers = self.loadFromRedis(self.redisWorkersKey)
-		self.workers = json.loads(workers)
+		if workers:
+			self.workers = json.loads(workers)
 
 	def loadUsers(self):
 		self.users = {}
 		users = self.loadFromRedis(self.redisUsersKey)
-		self.workers = json.loads(users)
+		if users:
+			self.users = json.loads(users)
 
-	def addWoker(self, worker):
+	def addWorker(self, worker):
 		if worker.uuid in self.workers:
 			return False
 		else:
 			self.workers[worker.uuid] = worker
-			self.saveToRedis(self.redisWorkersKey, json.dumps(self.workers))
+			#self.saveToRedis(self.redisWorkersKey, json.dumps(self.workers))
 			return True
 
-	def delWoker(self, worker):
+	def delWorker(self, worker):
 		if not worker.uuid in self.workers:
 			return False
 		else:
 			del self.workers[workers.uuid]
-			self.saveToRedis(self.redisWorkersKey, json.dumps(self.workers))
-			return True			
+			#self.saveToRedis(self.redisWorkersKey, json.dumps(self.workers))
+			return True
 
 	def addUser(self, user):
-		if user.uuid in user.workers:
+		if user.uuid in self.users:
 			return False
 		else:
 			self.users[user.uuid] = user
-			self.saveToRedis(self.redisUsersKey, json.dumps(self.users))
+			#self.saveToRedis(self.redisUsersKey, json.dumps(self.users))
 			return True
 
 	def delUser(self, user):
-		if not user.uuid in user.workers:
+		if not user.uuid in self.users:
 			return False
 		else:
 			del self.users[user.uuid]
-			self.saveToRedis(self.redisUsersKey, json.dumps(self.users))
+			#self.saveToRedis(self.redisUsersKey, json.dumps(self.users))
 			return True
 
 	def saveToRedis(self, key, value):
+		if self.redis:
+			self.redis.set(key, value)
 
 	def loadFromRedis(self, key):
+		if self.redis:
+			return self.redis.get(key)
 
 
 	#admin
@@ -345,6 +414,18 @@ class Master():
 	def listClients(self):
 		pass
 
+	def closeClients(self):
+		for client in self.clients:
+			self.clients[client].close()
+
+	def closeWorkers(self):
+		for worker in self.workers:
+			self.workers[worker].close()
+
+	def exit(self):
+		self.thread.stop()
+		self.redis.publish(self.subChannels[0], "exit")
+
 
 	#worker side interfaces
 	#worker -> master
@@ -352,7 +433,9 @@ class Master():
 		if not workerID in self.workers:
 			worker = Worker("worker/1", workerType, workerID)			#temp code for debug 
 			if worker:
-				self.workers[workerID] = worker
+
+				#self.workers[workerID] = worker
+				self.addWorker(worker)
 				worker.run()
 
 				self.sendResponse(worker.pubChannel, "ok")
@@ -387,33 +470,41 @@ class Master():
 
 
 	#client side interfaces
-	def connect(self, userID, sessionID):
-		if not sessionID in self.clients:
-			client = Client(userID, clientID)
-			if client:
-				self.clients[clientID] = client
-				client.run()
-				self.sendResponse(client.pubChannel, "ok")
-
-				print("new client connected:", clientID)
-			else:
-				e = "error: client connected failed"
-				self.sendResponse(client.pubChannel, e)
-
-				print(e)
-
+	def connect(self, userID, clientID):
+		if not userID in self.users:
+			user = User(userID)
+			if user:
+				self.addUser(user)
 		else:
-			e = "error: client exist "
+			user = self.users[userID]
+
+		client = Client(userID, clientID, self)
+			
+		if client:
+			self.clients[clientID] = client
+			client.run()
+			self.sendResponse(client.pubChannel, "ok")
+
+			print("new client connected:", clientID)
+		else:
+			e = "error: client connected failed"
 			self.sendResponse(client.pubChannel, e)
 
 			print(e)
 
+	def close(self, userID, clientID):
+		if clientID in self.clients:
+			client = self.clients[clientID]
 
-	def close(self, client):
+			client.thread.stop()
+			self.sendResponse(client.pubChannel, "ok")
+			del self.clients[clientID]
+
+	def list(self, userID):
 		pass
 
-	def list(self, client):
-		pass
+
+
 
 
 
@@ -428,27 +519,34 @@ if __name__ == "__main__":
 	master = Master()
 	master.run()
 
-
 	while True:
-		worker = master.pickWorker("redis")
-		if worker:
+		line = raw_input(">")
+		if line == 'exit':
+			master.closeWorkers()
+			master.closeClients()
+			master.exit()
 			break
-		else:
-			time.sleep(1)
 
-	sender = "client123"
-	worker.thread.addQueue(sender)				#a queue for each client session
-	error, actor = worker.createActor(sender, ['worker', 'worker/air_sensor'], 'air_sensor')
+	#while True:
+	#	worker = master.pickWorker("redis")
+	#	if worker:
+	#		break
+	#	else:
+	#		time.sleep(1)
 
-	if error == 'ok':
-		code = loadCode("task.py")
-		ret, response = worker.loadActor(sender, actor, "task", code)
-		if ret == 'ok':
-			worker.enableActor(sender, actor)
-		else:
-			print response
-	else:
-		print(error)
+	#sender = "client123"
+	#worker.thread.addQueue(sender)				#a queue for each client session
+	#error, actor = worker.createActor(sender, ['worker', 'worker/air_sensor'], 'air_sensor')
+
+	#if error == 'ok':
+	#	code = loadCode("task.py")
+	#	ret, response = worker.loadActor(sender, actor, "task", code)
+	#	if ret == 'ok':
+	#		worker.enableActor(sender, actor)
+	#	else:
+	#		print response
+	#else:
+	#	print(error)
 
 
 

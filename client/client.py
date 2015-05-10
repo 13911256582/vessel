@@ -52,6 +52,7 @@ class RedisThread(threading.Thread):
 
 	def stop(self):
 		self.thread_stop = True
+		self.redis.publish(self.context.subChannels[0], "exit")
 
 
 class ClientThread(RedisThread):
@@ -60,8 +61,10 @@ class ClientThread(RedisThread):
 		self.handler = self
 		#self.callback = None
 
-	def onMessage(self, topic, msg, context):
-		print("-->", self.name, "topic:", topic, "message:", msg)
+	def onMessage(self, msg, context):
+		topic = msg['channel']
+
+		print("-->", "clientID:", self.name, "topic:", topic, "message:", msg['data'])
 
 		client = context
 
@@ -70,7 +73,7 @@ class ClientThread(RedisThread):
 			return
 
 		if topic == 'client/' + client.uuid:
-			req = json.loads(msg)
+			req = json.loads(msg['data'])
 
 			if req['type'] == 'response':
 				print("-->", "response:", req['response'])
@@ -104,8 +107,8 @@ class Client():
 		self.alias = {}
 		self.masterHost = ''
 		self.masterChannel = ''
-		self.subscribeChannels = ''
-		self.publishChannel = ''
+		self.subChannels = ''
+		self.pubChannel = ''
 		self.queue = Queue.Queue()
 
 	def sendMessage(self, channel, message):
@@ -124,8 +127,8 @@ class Client():
 		self.redis = redis.StrictRedis()			#temp solution
 
 		self.masterChannel = masterChannel
-		self.subscribeChannels = subChannels
-		self.publishChannel = masterChannel + '/' + self.uuid
+		self.subChannels = subChannels
+		self.pubChannel = masterChannel + '/' + self.uuid
 
 		thread = ClientThread(self.uuid, subChannels, self)
 		thread.start()
@@ -133,23 +136,25 @@ class Client():
 		#this is not a good solution, need to wait the thread to start
 		time.sleep(1)
 
-		self.masterThread = thread
+		self.thread = thread
 
 		#notify master i am coming
 		req = {"type": "request", "request": "connect", "userID": self.userID, "clientID": self.uuid}
 		self.sendMessage(masterChannel, req)
+		e, response = self.getResponse(1)
+		print(e)
 
 	def exit(self):
 		req = {"type": "request", "request": "exit", "clientID": self.uuid}
-		self.sendMessage(masterChannel, req)
+		self.sendMessage(self.masterChannel, req)
 		self.thread.stop()
 
 	def map(self, source, topics, actorName):
 		req = {"type": "request",  "request": "map", "clientID": self.uuid, "source": source, "topics": topics, "actor": actorName}
-		self.sendMessage(masterChannel, req)
+		self.sendMessage(self.pubChannel, req)
 		e, response = self.getResponse(1)
 		if e == 'ok':
-			uuid = self.response['actor']
+			uuid = response['actor']
 			actor = Actor(actorName, uuid, source, topics)
 			self.actors[uuid] = actor
 			self.alias[actorName] = actor
@@ -209,7 +214,7 @@ class Client():
 
 if __name__ == "__main__":
 
-	client = Client()
+	client = Client("client123")
 	while True:
 		line = raw_input(">")
 
